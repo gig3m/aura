@@ -116,6 +116,7 @@ static void gpu_park(struct exc_info *ctx, const char *why)
         .code = 0x47505521, /* 'GPU!' */
         .info = ctx,
     };
+    sptm_virt_park_others();
     uartproxy_run(&start);
     while (1)
         sysop("wfe");

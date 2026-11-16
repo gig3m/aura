@@ -485,6 +485,50 @@ static void mmu_init_pagetables(void)
     return;
 }
 
+/*
+ * Put fresh heap pages behind [va, va + size), contents kept: for image data that a core cannot
+ * write where it lies (T8142: iBoot locks CTRR_D over the whole boot object on every secondary,
+ * and a store of theirs into it faults with the MMU on or off). The caller must be the only core
+ * running. Each page's descriptor is replaced in one store right after its copy, with interrupts
+ * masked and nothing but registers, the stack and the heap touched in between, so no store to
+ * the page can fall between the copy and the switch. The range must not hold the stack in use.
+ */
+int mmu_relocate_pages(u64 va, u64 size)
+{
+    u64 page = PAGE_SIZE;
+
+    if (!mmu_active() || !size || ((va | size) & (page - 1)))
+        return -1;
+    u64 n = size / page;
+    u8 *fresh = memalign(page, size);
+    u64 **ent = malloc(n * sizeof(*ent));
+    if (!fresh || !ent)
+        return -2;
+    for (u64 i = 0; i < n; i++) {
+        u64 a = va + i * page;
+        u64 *l3 = mmu_pt_get_l3(a);
+        u64 *e = &l3[(a >> VADDR_L3_OFFSET_BITS) & MASK(VADDR_L3_INDEX_BITS)];
+        if (!IS_PTE(*e))
+            return -3;
+        ent[i] = (u64 *)((u64)e | REGION_RW_EL0);
+    }
+
+    u64 daif = mrs(DAIF);
+    msr(DAIF, daif | 0x3c0);
+    for (u64 i = 0; i < n; i++) {
+        u8 *to = fresh + i * page;
+        u64 d = (*ent[i] & ~PTE_TARGET_MASK) | (u64)to;
+        memcpy(to, (void *)(va + i * page), page);
+        *ent[i] = d;
+        sysop("dsb ishst");
+        sysop("tlbi vmalle1is");
+        sysop("dsb ish");
+        sysop("isb");
+    }
+    msr(DAIF, daif);
+    return 0;
+}
+
 void mmu_add_mapping(u64 from, u64 to, size_t size, u8 attribute_index, u64 perms)
 {
     if (mmu_map(from,

@@ -107,6 +107,8 @@ CONFIG_FLAGS = {
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
+    "AURA_RELOC_DATA",
+    "AURA_S2R_EXTRA",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -687,6 +689,12 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if env_on("AURA_RELOC_DATA"):
+        p.write32(sym["sptm_virt_reloc_data"], 1)
+        print("image data moves to the heap at guest entry (T8142 SMP)")
+    if os.environ.get("AURA_S2R_EXTRA"):
+        p.write32(sym["sptm_virt_s2r_extra"], env_int("AURA_S2R_EXTRA"))
+        print("extra stop-mode trace blocks, mask", os.environ["AURA_S2R_EXTRA"])
     if os.environ.get("AURA_S2R_USB_RETAKE"):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
