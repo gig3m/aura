@@ -147,6 +147,10 @@ static int s2r_nkeep;
  * second into its boot. */
 static bool s2r_keep_always;
 u32 sptm_virt_s2r_live;
+/* Stop mode, more blocks in the full entry trace (AURA_S2R_EXTRA): 1 the MCC's blocks (the AMCC
+ * planes without their first pages, which aura hooks itself), 2 aon-ptd, 4 the other
+ * coprocessors' mailboxes (not the SEP's). */
+u32 sptm_virt_s2r_extra;
 static volatile bool s2r_keep_released;
 
 /*
@@ -275,6 +279,64 @@ static bool s2r_is_mbox(const char *what)
 {
     size_t n = strlen(what);
     return n > 5 && !strcmp(what + n - 5, "-mbox");
+}
+
+/*
+ * The ring's tail for a console that may die before it has printed it all: the most wanted first,
+ * newest first within each class, one short line each. Classes: A writes and markers outside the
+ * mailboxes and SPMI buses, with the pc; B SPMI writes; C mailbox writes; D the reads outside the
+ * mailboxes. First all four classes of the last @near records (the sleep entry itself), then A,
+ * B and C of the @far records before them. Line: class, record, counter, cpu or width, address,
+ * value (and pc).
+ */
+static u64 s2r_dump_class(u64 from, u64 to, int pass)
+{
+    u64 n = 0;
+    for (u64 i = to; i-- > from;) {
+        struct s2r_rec *r = &sptm_virt_s2r_ring[i % sptm_virt_s2r_nrec];
+        unsigned cpu = (r->meta >> 51) & 15;
+        u64 pa = r->meta & GENMASK(47, 0);
+        if (r->meta & S2R_MARKER) {
+            if (pass == 0) {
+                printf("S2A %lu %lx c%u MARK %.8s %lx\n", i, r->t, cpu, (const char *)&r->pc,
+                       r->val);
+                n++;
+            }
+            continue;
+        }
+        bool first, wr = r->meta & S2R_WRITE;
+        const char *what = s2r_page_name(pa & ~0x3fffUL, &first);
+        bool mbox = s2r_is_mbox(what), spmi = !strncmp(what, "spmi", 4);
+        int cls = wr ? (mbox ? 2 : spmi ? 1 : 0) : (mbox ? -1 : 3);
+        if (cls != pass)
+            continue;
+        unsigned w = 8u << ((r->meta >> 48) & 3);
+        if (pass == 0)
+            printf("S2A %lu %lx c%u W%u %lx %lx %lx\n", i, r->t, cpu, w, pa, r->val, r->pc);
+        else
+            printf("S2%c %lu %lx %c%u %lx %lx\n", "ABCD"[pass], i, r->t, wr ? 'W' : 'R', w, pa,
+                   r->val);
+        n++;
+    }
+    return n;
+}
+
+void sptm_virt_s2r_dump_prio(u64 near, u64 far)
+{
+    if (!sptm_virt_s2r_ring)
+        return;
+    u64 head = sptm_virt_s2r_head;
+    u64 have = min(head, sptm_virt_s2r_nrec);
+    near = min(near, have);
+    far = min(far, have - near);
+    printf("SPTM-virt[s2r]: prio dump: head %lu, near %lu, far %lu, CNTFRQ %lu\n", head, near, far,
+           mrs(CNTFRQ_EL0));
+    for (int pass = 0; pass < 4; pass++)
+        printf("SPTM-virt[s2r]: prio dump: near class %c complete, %lu lines\n", "ABCD"[pass],
+               s2r_dump_class(head - near, head, pass));
+    for (int pass = 0; pass < 3; pass++)
+        printf("SPTM-virt[s2r]: prio dump: far class %c complete, %lu lines\n", "ABCD"[pass],
+               s2r_dump_class(head - near - far, head - near, pass));
 }
 
 /* A 16-byte access (a trapped LDP/STP: width 4 and two values) as one LDP/STP, as the guest issued
@@ -587,12 +649,13 @@ static void __attribute__((noreturn)) s2r_stop_before_timer(struct exc_info *ctx
            smp_id(), addr, val, ctx->elr, s2r_twi_mask, s2r_parked_mask, sptm_virt_s2r_head);
     if (s2r_nvme_quiet_page)
         printf("SPTM-virt[s2r]: %lu NVMe per-I/O writes not recorded\n", s2r_nvme_quiet_n);
-    sptm_virt_s2r_dump_tail(4096);
+    sptm_virt_s2r_dump_prio(6000, 60000); /* whole classes, newest first: the proxy read-out fails with ten cores */
     struct uartproxy_msg_start start = {
         .reason = START_HV,
         .code = 0x53325221, /* 'S2R!' */
         .info = ctx,
     };
+    sptm_virt_park_others();
     uartproxy_run(&start);
     while (1)
         sysop("wfe");
@@ -627,10 +690,11 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
     printf("SPTM-virt[s2r]: macOS reached its final WFI on the S2R-timer core cpu%d; parked 0x%x; "
            "%lu records. Stopping in the proxy (stop mode).\n",
            cpu, s2r_parked_mask, sptm_virt_s2r_head);
-    sptm_virt_s2r_dump_tail(4096);
+    sptm_virt_s2r_dump_prio(6000, 60000); /* whole classes, newest first: the proxy read-out fails with ten cores */
     struct uartproxy_msg_start start = {
         .reason = START_HV, .code = 0x53325221, /* 'S2R!' */
     };
+    sptm_virt_park_others();
     uartproxy_run(&start);
     while (1)
         sysop("wfe");
@@ -639,6 +703,52 @@ bool sptm_virt_s2r_wfi(u64 *regs, u64 esr)
 static void s2r_wakerec_fallback(void);
 static void s2r_wakerec_pump(void);
 static bool s2r_wakerec_printed;
+
+/*
+ * XNU wrote one of the PMGR CPU-start registers (+0x4: BIT(cpu); +0x8 + 4 * cluster: BIT(core),
+ * which is what lets the core run). Watch the started core's crumbs for a while. If it has not
+ * reached its SPTM entry with the MMU on by then, say where it stopped and give the host the
+ * proxy: the boot core would only wait for it forever.
+ */
+static void s2r_cpustart_watch(struct exc_info *ctx, u64 addr, u64 val)
+{
+    u8 *c = (u8 *)sptm_smp_crumbs;
+    u64 off = addr & 0x3fff, f = mrs(CNTFRQ_EL0), t0 = mrs(CNTPCT_EL0);
+    int slot = off >= 8 ? (int)((off - 8) / 4) * 8 + __builtin_ctzl(val) : -1;
+    u8 st = 0;
+
+    if (slot < 0 || slot >= 16) {
+        printf("SPTM-virt[smp]: CPUSTART [0x%lx] <- 0x%lx (pc 0x%lx)\n", addr, val, ctx->elr);
+        return;
+    }
+    do {
+        dc_civac_range(c + slot * 64, 64);
+        st = c[slot * 64];
+        if (st >= 7 || (st & 0x80))
+            break;
+    } while (mrs(CNTPCT_EL0) - t0 < f / 2);
+    u64 *w = (u64 *)(c + slot * 64 + 8);
+    printf("SPTM-virt[smp]: CPUSTART [0x%lx] <- 0x%lx (pc 0x%lx): slot %d stage 0x%x count %u "
+           "after %lu us\n",
+           addr, val, ctx->elr, slot, st, c[slot * 64 + 1], (mrs(CNTPCT_EL0) - t0) * 1000000 / f);
+    if (st >= 7 && !(st & 0x80))
+        return;
+    if (st & 0x80)
+        printf("SPTM-virt[smp]: slot %d faulted with its MMU off: ESR 0x%lx ELR 0x%lx FAR 0x%lx\n",
+               slot, w[0], w[1], w[2]);
+    printf("SPTM-virt[smp]: SMP-PARK: the started core did not reach SPTM; stopping in the "
+           "proxy\n");
+    iodev_console_flush();
+    struct uartproxy_msg_start start = {
+        .reason = START_HV,
+        .code = 0x534d5021, /* 'SMP!' */
+        .info = ctx,
+    };
+    sptm_virt_park_others();
+    uartproxy_run(&start);
+    while (1)
+        sysop("wfe");
+}
 
 static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int width)
 {
@@ -723,7 +833,9 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     const char *what = s2r_page_name(addr & ~0x3fffUL, &first);
     bool timer = write && width <= 3 && *val == 1 && !strcmp(what, "pmgr-aon-pst") &&
                  (addr & 0x7fff) == S2R_TIMER_OFF && s2r_armed();
-    if (timer && !s2r_go) {
+    /* AURA_S2R_GO_COUNT here too (J813): after n go-mode wakes, the next commit stops like stop
+     * mode, so the ring holds the sleep, the wake and the next entry for the proxy to read. */
+    if (timer && (!s2r_go || (sptm_virt_s2r_go_count && s2r_wake_count >= sptm_virt_s2r_go_count))) {
         sptm_virt_rg_stop_wd2();
         sptm_virt_s2r_note(ctx, addr, *val, true, width);
         s2r_stop_before_timer(ctx, addr, *val);
@@ -748,6 +860,10 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     sptm_virt_mmio_rw(addr, val, write, width);
     sptm_virt_s2r_note(ctx, addr, *val, write, width);
+    bool cpustart = !strcmp(what, "pmgr-soc-misc") && (addr & 0xfffff) >= 0x34004 &&
+                    (addr & 0xfffff) < 0x34018;
+    if (write && cpustart && *val && sptm_smp_crumbs)
+        s2r_cpustart_watch(ctx, addr, *val);
     /* AURA_S2R_LIVE: the guest's writes to the hooked power blocks, as they happen, for a stall
      * that leaves nothing to read back. */
     if (write && sptm_virt_s2r_live) {
@@ -799,7 +915,8 @@ static bool s2r_hook(struct exc_info *ctx, u64 addr, u64 *val, bool write, int w
     }
     /* Each core disables itself in the PMGR CPU block on its way to its last WFI; a cluster armed
      * off is the same moment for the boot core. */
-    if (write && (!strcmp(what, "pmgr-soc-misc") ||
+    /* Not a write that starts another core: the start registers are in the same block. */
+    if (write && ((!strcmp(what, "pmgr-soc-misc") && !cpustart) ||
                   (!strcmp(what, "pmgr-cluster-ctl") && (*val & 0xf) == 0)))
         s2r_core_sleeps();
     return true;
@@ -1028,6 +1145,37 @@ static void s2r_hook_full(void)
     s2r_hook_adt("/arm-io/smc", 0, "smc-mbox", 0x8000, 0x4000);
     s2r_hook_adt("/arm-io/pmp", 0, "pmp-mbox", 0x8000, 0x4000);
     s2r_hook_adt("/arm-io/dcp", 0, "dcp-mbox", 0x8000, 0x4000);
+    if (sptm_virt_s2r_extra & 1) {
+        int mp[8];
+        u64 pa, sz;
+        /* reg[0] is the cluster block, hooked above. reg[1] holds the AMCC planes, 0x40000 apart:
+         * the first page of each is aura's own hook (amcc_hook) and stays that. */
+        if (adt_path_offset_trace(adt, "/arm-io/mcc", mp) >= 0)
+            for (int r = 1; r < 32 && adt_get_reg(adt, mp, "reg", r, &pa, &sz) >= 0; r++) {
+                if (r == 1) {
+                    for (u64 page = pa; page < pa + sz; page += 0x4000)
+                        if ((page - pa) & 0x3ffff)
+                            s2r_hook_range("amcc", page, 0x4000);
+                } else {
+                    s2r_hook_range(r < 8 ? "mcc-b" : r < 10 ? "mcc-ptd" : "mcc-ch", pa, sz);
+                }
+            }
+    }
+    if (sptm_virt_s2r_extra & 2)
+        for (int r = 0; r < 4; r++)
+            s2r_hook_adt("/arm-io/aon-ptd", r, "aon-ptd", 0, 0);
+    if (sptm_virt_s2r_extra & 4) {
+        static const struct {
+            const char *path, *what;
+        } mb[] = {
+            {"/arm-io/aop", "aop-mbox"},       {"/arm-io/sio", "sio-mbox"},
+            {"/arm-io/ans", "ans-mbox"},       {"/arm-io/mtp", "mtp-mbox"},
+            {"/arm-io/dcpext0", "dcpext0-mbox"}, {"/arm-io/dcpext1", "dcpext1-mbox"},
+            {"/arm-io/gfx-asc", "gfx-mbox"},
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(mb); i++)
+            s2r_hook_adt(mb[i].path, 0, mb[i].what, 0x8000, 0x4000);
+    }
 }
 
 /* ---- T6050: the coprocessors and the memory side ---------------------------------------------
@@ -1328,7 +1476,10 @@ void sptm_virt_s2r_setup(bool cdc)
         return;
     }
     /* A timer-only sleep has no stop before the commit to read a ring from: keep it all. */
-    u64 ring_bytes = s2r_soc->timer_only ? S2R_RING_BYTES_BIG : S2R_RING_BYTES;
+    /* With AURA_S2R_GO_COUNT the ring must hold a sleep, its wake and the next entry. */
+    u64 ring_bytes = s2r_soc->timer_only         ? S2R_RING_BYTES_BIG
+                     : sptm_virt_s2r_go_count ? (48UL << 20)
+                                              : S2R_RING_BYTES;
     if (!s2r_ring_alloc(ring_bytes)) {
         printf("SPTM-virt[s2r]: no memory for the ring; sleep path off\n");
         sptm_virt_flags &= ~SPTM_VIRT_S2R;

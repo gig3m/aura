@@ -107,6 +107,9 @@ CONFIG_FLAGS = {
     "AURA_AURACTL_DCC": 1 << 10,  # arm auractl's kext-free DCC transport (off by default)
 }
 KNOWN_ENV = {
+    "AURA_RELOC_DATA",
+    "AURA_S2R_EXTRA",
+    "AURA_AURA_HEAP_MIB",
     "AURA_KEEP_EXCLAVES",
     "AURA_OS_LONG_VERSION",
     "AURA_KEEP_BOOT_VIDEO",
@@ -687,6 +690,12 @@ def configure(p, sym, plan, adt, ctl_cookie=0):
     if os.environ.get("AURA_S2R_QUIESCE"):
         p.write32(sym["sptm_virt_s2r_quiesce"], env_int("AURA_S2R_QUIESCE"))
         print("AMCC quiesce writes at the commit:", os.environ["AURA_S2R_QUIESCE"])
+    if env_on("AURA_RELOC_DATA"):
+        p.write32(sym["sptm_virt_reloc_data"], 1)
+        print("image data moves to the heap at guest entry (T8142 SMP)")
+    if os.environ.get("AURA_S2R_EXTRA"):
+        p.write32(sym["sptm_virt_s2r_extra"], env_int("AURA_S2R_EXTRA"))
+        print("extra stop-mode trace blocks, mask", os.environ["AURA_S2R_EXTRA"])
     if os.environ.get("AURA_S2R_USB_RETAKE"):
         p.write32(sym["sptm_virt_s2r_usb_retake"], env_int("AURA_S2R_USB_RETAKE"))
         p.write32(sym["sptm_virt_s2r_usb_delay_ms"], env_int("AURA_S2R_USB_RETAKE_MS"))
@@ -750,7 +759,11 @@ def main():
     iface = UartInterface()
     p = AuraProxy(iface, debug=False)
     bootstrap_port(iface, p)
-    u = ProxyUtils(p, heap_size=128 * 1024 * 1024)
+    # J813 under the padded el2 objects: aura's carve-out is only 160 MiB (its floor is above
+    # the 128 MiB execute window), and aura has used ~33 MiB of it by now, so the default 128 MiB
+    # reservation for aura's own heap reached into SPTM's window and sptm_virt_load refused.
+    u = ProxyUtils(p, heap_size=128 * 1024 * 1024,
+                   aura_heap=int(os.environ.get("AURA_AURA_HEAP_MIB", "112")) * 1024 * 1024)
     sym = Symbols(args.nm, args.elf, p.get_base())
 
     # SPTM's managed window, as aura computed it: above aura and everything iBoot left low,

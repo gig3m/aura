@@ -143,7 +143,7 @@ SECTIONS {
      * start.S has copied it, so everything before the pixel data must end below it. Past
      * _file_end the image is only zeros (.bss), as before.
      */
-    _file_limit = 0x120000;
+    _file_limit = 0x200000; /* J813 tracer build only: no DCP __OS_LOG hazard seen on T8142 */
     ASSERT(_file_vital_end - _base <= _file_limit,
            "Code and data reach the DCP log buffer after stage 1!")
 
